@@ -39,11 +39,51 @@ async fn find_active_player(conn: &Connection) -> Result<String> {
 	.await?;
 
 	let names: Vec<String> = proxy.call("ListNames", &()).await?;
-	names
+	let last = LAST_PLAYING.lock().unwrap().clone();
+	let mut best = None;
+	for name in names
 		.into_iter()
-		.find(|name| name.starts_with("org.mpris.MediaPlayer2."))
+		.filter(|name| name.starts_with("org.mpris.MediaPlayer2."))
+	{
+		// The player that most recently started playing wins, like playerctld.
+		let owner: Option<String> = proxy.call("GetNameOwner", &(&name)).await.ok();
+		if last.is_some() && owner == last {
+			return Ok(name);
+		}
+		// Otherwise prefer playing over paused, and players with track info among equals.
+		let player = Proxy::new(
+			conn,
+			name.clone(),
+			"/org/mpris/MediaPlayer2",
+			"org.mpris.MediaPlayer2.Player",
+		)
+		.await?;
+		let status: String = player
+			.get_property("PlaybackStatus")
+			.await
+			.unwrap_or_default();
+		let metadata: HashMap<String, zvariant::OwnedValue> =
+			player.get_property("Metadata").await.unwrap_or_default();
+		let score = match status.as_str() {
+			"Playing" => 4,
+			"Paused" => 2,
+			_ => 0,
+		} + u8::from(
+			metadata.contains_key("xesam:artist") || metadata.contains_key("mpris:artUrl"),
+		);
+		if best
+			.as_ref()
+			.is_none_or(|(best_score, _)| score > *best_score)
+		{
+			best = Some((score, name));
+		}
+	}
+	best.map(|(_, name)| name)
 		.ok_or_else(|| anyhow::anyhow!("No MPRIS players found"))
 }
+
+/// Unique bus name of the player that most recently started playing.
+static LAST_PLAYING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 async fn get_mpris_proxy() -> Result<Proxy<'static>> {
 	let conn = Connection::session().await?;
@@ -221,12 +261,17 @@ async fn watch_album_art() {
 			}
 		};
 
+		let player_owner: Option<String> = dbus_proxy
+			.inner()
+			.call("GetNameOwner", &(&player_name))
+			.await
+			.ok();
+
 		let signal_rule = match MatchRule::builder()
 			.msg_type(MessageType::Signal)
 			.interface("org.freedesktop.DBus.Properties")
 			.and_then(|b| b.member("PropertiesChanged"))
 			.and_then(|b| b.path("/org/mpris/MediaPlayer2"))
-			.and_then(|b| b.sender(player_name.as_str()))
 			.map(|b| b.build())
 		{
 			Ok(rule) => rule,
@@ -293,6 +338,20 @@ async fn watch_album_art() {
 			};
 
 			if interface != "org.mpris.MediaPlayer2.Player" {
+				continue;
+			}
+
+			// Switch to any player that starts playing; ignore the others.
+			let sender = header.sender().ok().flatten().map(|s| s.to_string());
+			if let Some(status) = changed_properties.get("PlaybackStatus")
+				&& status.downcast_ref::<str>() == Some("Playing")
+			{
+				*LAST_PLAYING.lock().unwrap() = sender.clone();
+				if sender != player_owner {
+					break;
+				}
+			}
+			if sender != player_owner {
 				continue;
 			}
 
